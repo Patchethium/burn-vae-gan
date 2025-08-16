@@ -78,7 +78,7 @@ impl<B: Backend> VAE<B> {
       dec: MLP::new(decoder_layers, nn::Relu),
       enc_mu,
       enc_logvar,
-      kld_weight
+      kld_weight,
     }
   }
 
@@ -151,7 +151,7 @@ impl<B: AutodiffBackend> ValidStep<MnistBatch<B>, VaeOutput<B>> for VAE<B> {
 
 #[derive(Config)]
 pub struct MnistTrainingConfig {
-  #[config(default = 20)]
+  #[config(default = 30)]
   pub num_epochs: usize,
 
   #[config(default = 64)]
@@ -163,7 +163,7 @@ pub struct MnistTrainingConfig {
   #[config(default = 42)]
   pub seed: u64,
 
-  #[config(default=1e-1)]
+  #[config(default = 1e-1)]
   pub kld_weight: f32,
 
   pub optimizer: AdamConfig,
@@ -286,17 +286,17 @@ fn run<B: AutodiffBackend>(device: B::Device) {
         let gen_image = valid_vae.decode(z);
         save_tensor_as_png(
           &recon_image.reshape([config.batch_size, 28, 28]),
-          format!("{}/image/recon_{}.png", ARTIFACT_DIR, epoch).as_str(),
+          format!("{}/image/{}_recon.png", ARTIFACT_DIR, epoch).as_str(),
         )
         .unwrap();
         save_tensor_as_png(
           &original_image.reshape([config.batch_size, 28, 28]),
-          format!("{}/image/original_{}.png", ARTIFACT_DIR, epoch).as_str(),
+          format!("{}/image/{}_original.png", ARTIFACT_DIR, epoch).as_str(),
         )
         .unwrap();
         save_tensor_as_png(
           &gen_image.reshape([config.batch_size, 28, 28]),
-          format!("{}/image/gen_{}.png", ARTIFACT_DIR, epoch).as_str(),
+          format!("{}/image/{}_gen.png", ARTIFACT_DIR, epoch).as_str(),
         )
         .unwrap();
       }
@@ -325,13 +325,15 @@ fn run<B: AutodiffBackend>(device: B::Device) {
           epoch, config.num_epochs, name, loss
         );
       });
+    if epoch % 10 == 0 || epoch == config.num_epochs {
+      valid_vae
+        .save_file(
+          format!("{ARTIFACT_DIR}/model"),
+          &NoStdTrainingRecorder::new(),
+        )
+        .expect("Failed to save trained model");
+    }
   }
-  vae
-    .save_file(
-      format!("{ARTIFACT_DIR}/model"),
-      &NoStdTrainingRecorder::new(),
-    )
-    .expect("Failed to save trained model");
 }
 
 fn main() {
