@@ -50,7 +50,7 @@ pub struct VAE<B: Backend> {
   kld_weight: f32,
 }
 
-const SIZES: [usize; 5] = [784, 512, 256, 128, 64];
+const SIZES: [usize; 4] = [784, 512, 256, 128];
 
 impl<B: Backend> Default for VAE<B> {
   fn default() -> Self {
@@ -96,12 +96,13 @@ impl<B: Backend> VAE<B> {
 
   pub fn reparameterize(&self, mu: Tensor<B, 2>, logvar: Tensor<B, 2>) -> Tensor<B, 2> {
     let std = logvar.exp().sqrt();
-    let eps = mu.random_like(burn::tensor::Distribution::Normal(0.0, 1.0));
+    let eps = mu.random_like(burn::tensor::Distribution::Normal(0f64, 1f64));
     mu + std * eps
   }
 
   pub fn decode(&self, z: Tensor<B, 2>) -> Tensor<B, 2> {
-    self.dec.forward(z)
+    let z = self.dec.forward(z);
+    z
   }
 
   pub fn forward(&self, input: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) {
@@ -154,9 +155,11 @@ impl<B: Backend> Discriminator<B> {
       .map(|window| nn::LinearConfig::new(window[0], window[1]).init(device))
       .collect::<Vec<_>>();
     let head = nn::LinearConfig::new(SIZES.last().copied().unwrap(), 1).init(device);
-    let loss = nn::loss::BinaryCrossEntropyLossConfig::new().init(device);
+    let loss = nn::loss::BinaryCrossEntropyLossConfig::new()
+      .with_logits(true)
+      .init(device);
     Self {
-      mlp: MLP::new(layers, 0.0),
+      mlp: MLP::new(layers, 0.3),
       head,
       loss,
     }
@@ -204,10 +207,10 @@ impl<B: AutodiffBackend> ValidStep<MnistBatch<B>, VaeOutput<B>> for VAE<B> {
 
 #[derive(Config)]
 pub struct MnistTrainingConfig {
-  #[config(default = 30)]
+  #[config(default = 100)]
   pub num_epochs: usize,
 
-  #[config(default = 64)]
+  #[config(default = 128)]
   pub batch_size: usize,
 
   #[config(default = 4)]
@@ -218,6 +221,9 @@ pub struct MnistTrainingConfig {
 
   #[config(default = 0.1)]
   pub kld_weight: f32,
+
+  #[config(default = 10)]
+  pub warmup_epoch: usize,
 
   pub optimizer: AdamConfig,
 }
@@ -316,29 +322,35 @@ fn run<B: AutodiffBackend>(device: B::Device) {
       train_kld_loss += output.kld_loss.into_scalar().elem::<f32>();
       train_recon_loss += output.recon_loss.into_scalar().elem::<f32>();
 
-      // train disc first
-      let fake_images = output.recon.clone().no_grad();
-      let fake_loss = disc.forward_train(fake_images.clone(), true);
-      let real_images = batch.images.clone().no_grad();
-      let real_loss = disc.forward_train(real_images.clone(), false);
+      if epoch <= config.warmup_epoch {
+        let grad = output.loss.backward();
+        let grad = GradientsParams::from_grads(grad, &vae);
+        vae = gen_optimizer.step(1e-4, vae, grad);
+      } else {
+        // train disc first
+        let fake_images = output.recon.clone().no_grad();
+        let fake_loss = disc.forward_train(fake_images.clone(), true);
+        let real_images = batch.images.clone().no_grad();
+        let real_loss = disc.forward_train(real_images.clone(), false);
 
-      let disc_loss = fake_loss + real_loss;
+        let disc_loss = fake_loss + real_loss;
 
-      // update disc
-      let disc_grads = disc_loss.backward();
-      let disc_grads = GradientsParams::from_grads(disc_grads, &disc);
-      disc = disc_optimizer.step(1e-4, disc, disc_grads);
+        // update disc
+        let disc_grads = disc_loss.backward();
+        let disc_grads = GradientsParams::from_grads(disc_grads, &disc);
+        disc = disc_optimizer.step(1e-4, disc, disc_grads);
 
-      // Train generator (VAE) - need fresh forward pass since gradients were consumed
-      let output = vae.forward_train(batch.images.clone());
-      let fake_images_gen = output.recon.clone();
-      let gen_loss = disc.forward_train(fake_images_gen, false);
+        // Train generator (VAE) - need fresh forward pass since gradients were consumed
+        let output = vae.forward_train(batch.images.clone());
+        let fake_images_gen = output.recon.clone();
+        let gen_loss = disc.forward_train(fake_images_gen, false);
 
-      let vae_loss = output.loss + gen_loss;
+        let vae_loss = output.loss + gen_loss;
 
-      let vae_grads = vae_loss.backward();
-      let vae_grads = GradientsParams::from_grads(vae_grads, &vae);
-      vae = gen_optimizer.step(1e-4, vae, vae_grads);
+        let vae_grads = vae_loss.backward();
+        let vae_grads = GradientsParams::from_grads(vae_grads, &vae);
+        vae = gen_optimizer.step(1e-4, vae, vae_grads);
+      }
     }
 
     let avg_train_loss = train_loss / train_num_items as f32;
