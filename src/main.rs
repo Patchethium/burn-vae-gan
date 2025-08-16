@@ -5,6 +5,7 @@ use crate::data::MnistBatcher;
 use burn::backend::Wgpu;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::data::dataset::vision::MnistDataset;
+use burn::grad_clipping::GradientClipping;
 use burn::module::AutodiffModule;
 use burn::optim::decay::WeightDecayConfig;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
@@ -18,12 +19,13 @@ use image::{ImageBuffer, Luma};
 #[derive(Module, Debug)]
 pub struct MLP<B: Backend> {
   layers: Vec<nn::Linear<B>>,
-  activation: nn::Relu,
+  dropout: nn::Dropout,
 }
 
 impl<B: Backend> MLP<B> {
-  pub fn new(layers: Vec<nn::Linear<B>>, activation: nn::Relu) -> Self {
-    Self { layers, activation }
+  pub fn new(layers: Vec<nn::Linear<B>>, p: f32) -> Self {
+    let dropout = nn::DropoutConfig::new(p as f64).init();
+    Self { layers, dropout }
   }
 
   pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
@@ -31,7 +33,8 @@ impl<B: Backend> MLP<B> {
     let num_layers = self.layers.len();
     for idx in 0..(num_layers - 1) {
       x = self.layers[idx].forward(x);
-      x = self.activation.forward(x);
+      x = nn::Relu.forward(x);
+      x = self.dropout.forward(x);
     }
     x = self.layers[num_layers - 1].forward(x);
     x
@@ -47,7 +50,7 @@ pub struct VAE<B: Backend> {
   kld_weight: f32,
 }
 
-const SIZES: [usize; 4] = [784, 128, 64, 32];
+const SIZES: [usize; 5] = [784, 512, 256, 128, 64];
 
 impl<B: Backend> Default for VAE<B> {
   fn default() -> Self {
@@ -70,12 +73,13 @@ impl<B: Backend> VAE<B> {
       .map(|window| nn::LinearConfig::new(*window[0], *window[1]).init(device))
       .collect::<Vec<_>>();
 
-    let enc_mu = nn::LinearConfig::new(SIZES.last().copied().unwrap_or(32), 32).init(device);
-    let enc_logvar = nn::LinearConfig::new(SIZES.last().copied().unwrap_or(32), 32).init(device);
+    let last_size = SIZES.last().copied().unwrap();
+    let enc_mu = nn::LinearConfig::new(last_size, last_size).init(device);
+    let enc_logvar = nn::LinearConfig::new(last_size, last_size).init(device);
 
     Self {
-      enc: MLP::new(encoder_layers, nn::Relu),
-      dec: MLP::new(decoder_layers, nn::Relu),
+      enc: MLP::new(encoder_layers, 0.1),
+      dec: MLP::new(decoder_layers, 0.1),
       enc_mu,
       enc_logvar,
       kld_weight,
@@ -106,7 +110,7 @@ impl<B: Backend> VAE<B> {
     (mu, logvar, self.decode(z))
   }
 
-  pub fn forward_vae(&self, input: Tensor<B, 2>) -> VaeOutput<B> {
+  pub fn forward_train(&self, input: Tensor<B, 2>) -> VaeOutput<B> {
     let (mu, logvar, recon) = self.forward(input.clone());
     let recon_loss = burn::nn::loss::MseLoss::new().forward(
       recon.clone(),
@@ -127,6 +131,55 @@ impl<B: Backend> VAE<B> {
   }
 }
 
+/// the discriminator network, the same as Encoder in VAE
+/// with a classification head
+#[derive(Module, Debug)]
+struct Discriminator<B: Backend> {
+  mlp: MLP<B>,
+  head: nn::Linear<B>,
+  loss: nn::loss::BinaryCrossEntropyLoss<B>,
+}
+
+impl<B: Backend> Default for Discriminator<B> {
+  fn default() -> Self {
+    let device = B::Device::default();
+    Self::new(&device)
+  }
+}
+
+impl<B: Backend> Discriminator<B> {
+  pub fn new(device: &B::Device) -> Self {
+    let layers = SIZES
+      .windows(2)
+      .map(|window| nn::LinearConfig::new(window[0], window[1]).init(device))
+      .collect::<Vec<_>>();
+    let head = nn::LinearConfig::new(SIZES.last().copied().unwrap(), 1).init(device);
+    let loss = nn::loss::BinaryCrossEntropyLossConfig::new().init(device);
+    Self {
+      mlp: MLP::new(layers, 0.0),
+      head,
+      loss,
+    }
+  }
+
+  pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 1> {
+    let hidden = self.mlp.forward(input);
+    let pred = self.head.forward(hidden).squeeze(1);
+    pred
+  }
+
+  pub fn forward_train(&self, input: Tensor<B, 2>, fake: bool) -> Tensor<B, 1> {
+    let preds = self.forward(input);
+    let batch_size = preds.shape().dims[0];
+    let label: Tensor<B, 1, burn::tensor::Int> = if fake {
+      Tensor::zeros([batch_size], &preds.device())
+    } else {
+      Tensor::ones([batch_size], &preds.device())
+    };
+    self.loss.forward(preds.clone(), label)
+  }
+}
+
 #[derive(Debug)]
 pub struct VaeOutput<B: Backend> {
   pub loss: Tensor<B, 1>,       // total loss
@@ -138,14 +191,14 @@ pub struct VaeOutput<B: Backend> {
 
 impl<B: AutodiffBackend> TrainStep<MnistBatch<B>, VaeOutput<B>> for VAE<B> {
   fn step(&self, item: MnistBatch<B>) -> TrainOutput<VaeOutput<B>> {
-    let output = self.forward_vae(item.images);
+    let output = self.forward_train(item.images);
     TrainOutput::new(self, output.loss.backward(), output)
   }
 }
 
 impl<B: AutodiffBackend> ValidStep<MnistBatch<B>, VaeOutput<B>> for VAE<B> {
   fn step(&self, item: MnistBatch<B>) -> VaeOutput<B> {
-    self.forward_vae(item.images)
+    self.forward_train(item.images)
   }
 }
 
@@ -163,7 +216,7 @@ pub struct MnistTrainingConfig {
   #[config(default = 42)]
   pub seed: u64,
 
-  #[config(default = 1e-1)]
+  #[config(default = 0.1)]
   pub kld_weight: f32,
 
   pub optimizer: AdamConfig,
@@ -220,6 +273,7 @@ fn run<B: AutodiffBackend>(device: B::Device) {
   B::seed(config.seed);
 
   let mut vae = VAE::<B>::new(&device, config.kld_weight);
+  let mut disc = Discriminator::<B>::new(&device);
   let batcher = MnistBatcher::default();
 
   let dataloader_train = DataLoaderBuilder::new(batcher.clone())
@@ -237,7 +291,14 @@ fn run<B: AutodiffBackend>(device: B::Device) {
   let train_num_items = dataloader_train.num_items();
   let valid_num_items = dataloader_valid.num_items();
 
-  let mut optimizer = config.optimizer.init();
+  let mut gen_optimizer = config
+    .optimizer
+    .init()
+    .with_grad_clipping(GradientClipping::Value(0.1));
+  let mut disc_optimizer = config
+    .optimizer
+    .init()
+    .with_grad_clipping(GradientClipping::Value(0.1));
 
   for epoch in 1..config.num_epochs + 1 {
     let mut train_loss = 0.0;
@@ -249,16 +310,37 @@ fn run<B: AutodiffBackend>(device: B::Device) {
     let mut train_recon_loss = 0.0;
     let mut valid_recon_loss = 0.0;
     for (_idx, batch) in dataloader_train.iter().enumerate() {
-      let output = vae.forward_vae(batch.images.clone());
+      let output = vae.forward_train(batch.images.clone());
 
       train_loss += output.loss.clone().into_scalar().elem::<f32>();
       train_kld_loss += output.kld_loss.into_scalar().elem::<f32>();
       train_recon_loss += output.recon_loss.into_scalar().elem::<f32>();
 
-      let grads = output.loss.backward();
-      let grads = GradientsParams::from_grads(grads, &vae);
-      vae = optimizer.step(1e-4, vae, grads);
+      // train disc first
+      let fake_images = output.recon.clone().no_grad();
+      let fake_loss = disc.forward_train(fake_images.clone(), true);
+      let real_images = batch.images.clone().no_grad();
+      let real_loss = disc.forward_train(real_images.clone(), false);
+
+      let disc_loss = fake_loss + real_loss;
+
+      // update disc
+      let disc_grads = disc_loss.backward();
+      let disc_grads = GradientsParams::from_grads(disc_grads, &disc);
+      disc = disc_optimizer.step(1e-4, disc, disc_grads);
+
+      // Train generator (VAE) - need fresh forward pass since gradients were consumed
+      let output = vae.forward_train(batch.images.clone());
+      let fake_images_gen = output.recon.clone();
+      let gen_loss = disc.forward_train(fake_images_gen, false);
+
+      let vae_loss = output.loss + gen_loss;
+
+      let vae_grads = vae_loss.backward();
+      let vae_grads = GradientsParams::from_grads(vae_grads, &vae);
+      vae = gen_optimizer.step(1e-4, vae, vae_grads);
     }
+
     let avg_train_loss = train_loss / train_num_items as f32;
     let avg_train_kld_loss = train_kld_loss / train_num_items as f32;
     let avg_train_recon_loss = train_recon_loss / train_num_items as f32;
@@ -266,7 +348,7 @@ fn run<B: AutodiffBackend>(device: B::Device) {
     let valid_vae = vae.valid();
 
     for (idx, batch) in dataloader_valid.iter().enumerate() {
-      let output = valid_vae.forward_vae(batch.images.clone());
+      let output = valid_vae.forward_train(batch.images.clone());
 
       valid_loss += output.loss.clone().into_scalar().elem::<f32>();
       valid_kld_loss += output.kld_loss.into_scalar().elem::<f32>();
@@ -277,9 +359,10 @@ fn run<B: AutodiffBackend>(device: B::Device) {
         let recon_image = output.recon.clone();
         let original_image = batch.images.clone();
 
+        let last_size = SIZES.last().copied().unwrap();
         // generate a sample from N(0,I)
         let z = Tensor::random(
-          [config.batch_size, 32],
+          [config.batch_size, last_size],
           burn::tensor::Distribution::Normal(0f64, 1f64),
           &device,
         );
