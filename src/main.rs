@@ -50,7 +50,7 @@ pub struct VAE<B: Backend> {
   kld_weight: f32,
 }
 
-const SIZES: [usize; 4] = [784, 512, 256, 128];
+const SIZES: [usize; 5] = [784, 512, 256, 128, 32];
 
 impl<B: Backend> Default for VAE<B> {
   fn default() -> Self {
@@ -159,7 +159,7 @@ impl<B: Backend> Discriminator<B> {
       .with_logits(true)
       .init(device);
     Self {
-      mlp: MLP::new(layers, 0.3),
+      mlp: MLP::new(layers, 0.5),
       head,
       loss,
     }
@@ -171,7 +171,7 @@ impl<B: Backend> Discriminator<B> {
     pred
   }
 
-  pub fn forward_train(&self, input: Tensor<B, 2>, fake: bool) -> Tensor<B, 1> {
+  pub fn forward_adv(&self, input: Tensor<B, 2>, fake: bool) -> Tensor<B, 1> {
     let preds = self.forward(input);
     let batch_size = preds.shape().dims[0];
     let label: Tensor<B, 1, burn::tensor::Int> = if fake {
@@ -180,6 +180,34 @@ impl<B: Backend> Discriminator<B> {
       Tensor::ones([batch_size], &preds.device())
     };
     self.loss.forward(preds.clone(), label)
+  }
+  /// forward with feature matching loss
+  pub fn forward_fm(
+    &self,
+    fake_images: Tensor<B, 2>,
+    real_images: Tensor<B, 2>,
+  ) -> (Tensor<B, 1>, Tensor<B, 1>) {
+    let batch_size = fake_images.shape().dims[0].clone();
+    let feature_fake = self.mlp.forward(fake_images);
+    let feature_real = self.mlp.forward(real_images);
+    let fm_loss = nn::loss::MseLoss.forward(
+      feature_fake.clone(),
+      feature_real.clone(),
+      nn::loss::Reduction::Mean,
+    );
+    let fm_loss = fm_loss * 2.0;
+    let fake_label: Tensor<B, 1, Int> = Tensor::zeros([batch_size], &feature_fake.device());
+    let real_label: Tensor<B, 1, Int> = Tensor::ones([batch_size], &feature_real.device());
+
+    let fake_preds: Tensor<B, 1> = self.head.forward(feature_fake).squeeze(1);
+    let real_preds: Tensor<B, 1> = self.head.forward(feature_real).squeeze(1);
+
+    let fake_loss = self.loss.forward(fake_preds.clone(), fake_label);
+    let real_loss = self.loss.forward(real_preds.clone(), real_label);
+
+    let adv_loss = fake_loss + real_loss;
+
+    (fm_loss, adv_loss)
   }
 }
 
@@ -219,10 +247,10 @@ pub struct MnistTrainingConfig {
   #[config(default = 42)]
   pub seed: u64,
 
-  #[config(default = 0.1)]
+  #[config(default = 0.2)]
   pub kld_weight: f32,
 
-  #[config(default = 10)]
+  #[config(default = 20)]
   pub warmup_epoch: usize,
 
   pub optimizer: AdamConfig,
@@ -315,6 +343,10 @@ fn run<B: AutodiffBackend>(device: B::Device) {
 
     let mut train_recon_loss = 0.0;
     let mut valid_recon_loss = 0.0;
+
+    let mut train_adv_loss = 0.0;
+    let mut train_fm_loss = 0.0;
+    let mut train_gen_loss = 0.0;
     for (_idx, batch) in dataloader_train.iter().enumerate() {
       let output = vae.forward_train(batch.images.clone());
 
@@ -329,11 +361,15 @@ fn run<B: AutodiffBackend>(device: B::Device) {
       } else {
         // train disc first
         let fake_images = output.recon.clone().no_grad();
-        let fake_loss = disc.forward_train(fake_images.clone(), true);
         let real_images = batch.images.clone().no_grad();
-        let real_loss = disc.forward_train(real_images.clone(), false);
 
-        let disc_loss = fake_loss + real_loss;
+        let (adv_loss, fm_loss) = disc.forward_fm(fake_images, real_images);
+
+        // log disc losses
+        train_adv_loss += adv_loss.clone().into_scalar().elem::<f32>();
+        train_fm_loss += fm_loss.clone().into_scalar().elem::<f32>();
+
+        let disc_loss = adv_loss + fm_loss;
 
         // update disc
         let disc_grads = disc_loss.backward();
@@ -343,7 +379,10 @@ fn run<B: AutodiffBackend>(device: B::Device) {
         // Train generator (VAE) - need fresh forward pass since gradients were consumed
         let output = vae.forward_train(batch.images.clone());
         let fake_images_gen = output.recon.clone();
-        let gen_loss = disc.forward_train(fake_images_gen, false);
+        let gen_loss = disc.forward_adv(fake_images_gen, false);
+
+        // log generator losses
+        train_gen_loss += gen_loss.clone().into_scalar().elem::<f32>();
 
         let vae_loss = output.loss + gen_loss;
 
@@ -356,6 +395,9 @@ fn run<B: AutodiffBackend>(device: B::Device) {
     let avg_train_loss = train_loss / train_num_items as f32;
     let avg_train_kld_loss = train_kld_loss / train_num_items as f32;
     let avg_train_recon_loss = train_recon_loss / train_num_items as f32;
+    let avg_train_adv_loss = train_adv_loss / train_num_items as f32;
+    let avg_train_fm_loss = train_fm_loss / train_num_items as f32;
+    let avg_train_gen_loss = train_gen_loss / train_num_items as f32;
 
     let valid_vae = vae.valid();
 
@@ -401,15 +443,32 @@ fn run<B: AutodiffBackend>(device: B::Device) {
     let avg_valid_kld_loss = valid_kld_loss / valid_num_items as f32;
     let avg_valid_recon_loss = valid_recon_loss / valid_num_items as f32;
 
-    [avg_train_loss, avg_train_kld_loss, avg_train_recon_loss]
-      .iter()
-      .zip(["train/loss", "train/kld_loss", "train/recon_loss"].iter())
-      .for_each(|(loss, name)| {
-        println!(
-          "Epoch {}/{}, {}: {:.2e}",
-          epoch, config.num_epochs, name, loss
-        );
-      });
+    [
+      avg_train_loss,
+      avg_train_kld_loss,
+      avg_train_recon_loss,
+      avg_train_adv_loss,
+      avg_train_fm_loss,
+      avg_train_gen_loss,
+    ]
+    .iter()
+    .zip(
+      [
+        "train/loss",
+        "train/kld_loss",
+        "train/recon_loss",
+        "train/adv_loss",
+        "train/fm_loss",
+        "train/gen_loss",
+      ]
+      .iter(),
+    )
+    .for_each(|(loss, name)| {
+      println!(
+        "Epoch {}/{}, {}: {:.2e}",
+        epoch, config.num_epochs, name, loss
+      );
+    });
 
     [avg_valid_loss, avg_valid_kld_loss, avg_valid_recon_loss]
       .iter()
